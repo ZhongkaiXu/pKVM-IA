@@ -43,6 +43,7 @@
 #define PKVM_GHC_IOWRITE		PKVM_GHC_NUM(4)
 #define PKVM_GHC_START_CPU		PKVM_GHC_NUM(5)
 #define PKVM_GHC_PTDEV_MMIO_INFO	PKVM_GHC_NUM(6)
+/* READ takes GPA, count, start, and optional INFO generation (0 skips the check). */
 #define PKVM_GHC_PTDEV_MMIO_READ	PKVM_GHC_NUM(7)
 #define PKVM_GHC_GET_VE_GPA		PKVM_GHC_NUM(8)
 #define PKVM_GHC_PTDEV_PDMA_ALLOWED	PKVM_GHC_NUM(9)

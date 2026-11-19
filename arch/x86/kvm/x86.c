@@ -15225,7 +15225,7 @@ int pkvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		ret = pkvm_handle_ptdev_mmio_info(vcpu, a0, a1);
 		break;
 	case PKVM_GHC_PTDEV_MMIO_READ:
-		ret = pkvm_handle_ptdev_mmio_read(vcpu, a0, a1, a2);
+		ret = pkvm_handle_ptdev_mmio_read(vcpu, a0, a1, a2, a3);
 		break;
 #endif
 	case PKVM_GHC_GET_VE_GPA:

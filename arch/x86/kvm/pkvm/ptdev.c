@@ -927,7 +927,7 @@ int pkvm_get_ptdev_mmio_info(struct pkvm_vm *vm,
 }
 
 int pkvm_read_ptdev_mmio_allow_ranges(struct pkvm_vm *vm, u16 start,
-				      u16 nr_ranges,
+				      u16 nr_ranges, u16 generation,
 				      struct pkvm_guest_mmio_allow_range *ranges)
 {
 	int ret = 0;
@@ -936,6 +936,10 @@ int pkvm_read_ptdev_mmio_allow_ranges(struct pkvm_vm *vm, u16 start,
 		return -EINVAL;
 
 	pkvm_spin_lock(&vm->lock);
+	if (generation && generation != vm->mmio_allow_generation) {
+		ret = -EAGAIN;
+		goto out;
+	}
 	if (start >= vm->mmio_allow_nr_ranges ||
 	    nr_ranges > vm->mmio_allow_nr_ranges - start) {
 		ret = -EINVAL;
@@ -1028,7 +1032,7 @@ int pkvm_handle_ptdev_mmio_info(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
 }
 
 int pkvm_handle_ptdev_mmio_read(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
-				u16 nr_ranges, u16 start)
+				u16 nr_ranges, u16 start, u16 generation)
 {
 	struct pkvm_vm *vm = to_pkvm(vcpu->kvm);
 	struct pkvm_guest_mmio_allow_range
@@ -1038,7 +1042,7 @@ int pkvm_handle_ptdev_mmio_read(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
 	if (!guest_gpa || !nr_ranges || nr_ranges > ARRAY_SIZE(ranges))
 		return -KVM_EINVAL;
 
-	ret = pkvm_read_ptdev_mmio_allow_ranges(vm, start, nr_ranges, ranges);
+	ret = pkvm_read_ptdev_mmio_allow_ranges(vm, start, nr_ranges, generation, ranges);
 	if (ret)
 		return ret;
 

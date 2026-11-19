@@ -95,12 +95,12 @@ int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
 int pkvm_get_ptdev_mmio_info(struct pkvm_vm *vm,
 			     struct pkvm_guest_mmio_info *info);
 int pkvm_read_ptdev_mmio_allow_ranges(struct pkvm_vm *vm, u16 start,
-				      u16 nr_ranges,
+				      u16 nr_ranges, u16 generation,
 				      struct pkvm_guest_mmio_allow_range *ranges);
 int pkvm_handle_ptdev_mmio_info(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
 				unsigned long size);
 int pkvm_handle_ptdev_mmio_read(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
-				u16 nr_ranges, u16 start);
+				u16 nr_ranges, u16 start, u16 generation);
 int pkvm_handle_ptdev_pdma_allowed(struct kvm_vcpu *vcpu, u64 guest_segment,
 				   u64 guest_bdf);
 bool pkvm_host_hpa_hits_boot_ptdev_bar(u64 hpa, u64 size);

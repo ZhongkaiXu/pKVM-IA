@@ -3,6 +3,7 @@
 #include <linux/kvm_para.h>
 #include <linux/io.h>
 #include <linux/pci.h>
+#include <linux/sched.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
@@ -167,6 +168,7 @@ static int pkvm_refresh_mmio_allowlist(void)
 	memset(&pkvm_mmio_refresh_info, 0, sizeof(pkvm_mmio_refresh_info));
 	memset(pkvm_mmio_refresh_ranges, 0, sizeof(pkvm_mmio_refresh_ranges));
 
+retry:
 	ret = kvm_hypercall2(PKVM_GHC_PTDEV_MMIO_INFO,
 			     __pa(&pkvm_mmio_refresh_info),
 			     sizeof(pkvm_mmio_refresh_info));
@@ -180,9 +182,14 @@ static int pkvm_refresh_mmio_allowlist(void)
 	}
 
 	if (pkvm_mmio_refresh_info.nr_ranges) {
-		ret = kvm_hypercall3(PKVM_GHC_PTDEV_MMIO_READ,
+		ret = kvm_hypercall4(PKVM_GHC_PTDEV_MMIO_READ,
 				     __pa(pkvm_mmio_refresh_ranges),
-				     pkvm_mmio_refresh_info.nr_ranges, 0);
+				     pkvm_mmio_refresh_info.nr_ranges, 0,
+				     pkvm_mmio_refresh_info.generation);
+		if (ret == -EAGAIN) {
+			cond_resched();
+			goto retry;
+		}
 		if (ret)
 			goto out;
 	}
