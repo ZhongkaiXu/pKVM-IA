@@ -404,6 +404,7 @@ static int pkvm_vm_ioctl_set_ptdev_mmio_metadata(
 	struct kvm_protected_vm_ptdev_mmio_metadata __user *umeta)
 {
 	struct kvm_pkvm_vm *pkvm = &kvm->arch.pkvm;
+	struct kvm_ptdev_mmio_metadata *cached;
 	struct kvm_ptdev_mmio_metadata kmeta;
 	int ret;
 
@@ -417,22 +418,30 @@ static int pkvm_vm_ioctl_set_ptdev_mmio_metadata(
 
 	/* Also serializes metadata submission with successful device removal. */
 	mutex_lock(&pkvm->finalized_lock);
-	if (pkvm->ptdev_mmio_metadata_valid) {
-		ret = pkvm_ptdev_mmio_metadata_equal(&pkvm->ptdev_mmio_metadata,
-						     &kmeta) ?
+	cached = xa_load(&pkvm->ptdev_metadata_by_bdf, kmeta.bdf);
+	if (cached) {
+		ret = pkvm_ptdev_mmio_metadata_equal(cached, &kmeta) ?
 		      0 : -EBUSY;
 		goto out;
 	}
 
+	cached = kmemdup(&kmeta, sizeof(kmeta), GFP_KERNEL_ACCOUNT);
+	if (!cached) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	ret = xa_insert(&pkvm->ptdev_metadata_by_bdf, kmeta.bdf, cached, GFP_KERNEL_ACCOUNT);
+	if (ret) {
+		kfree(cached);
+		goto out;
+	}
 	pkvm->ptdev_mmio_metadata = kmeta;
 	pkvm->ptdev_mmio_metadata_valid = true;
-
 	ret = pkvm_sync_ptdev_mmio_metadata(kvm);
-	if (ret) {
-		memset(&pkvm->ptdev_mmio_metadata, 0,
-		       sizeof(pkvm->ptdev_mmio_metadata));
-		pkvm->ptdev_mmio_metadata_valid = false;
-	}
+	pkvm->ptdev_mmio_metadata_valid = false;
+	memset(&pkvm->ptdev_mmio_metadata, 0, sizeof(pkvm->ptdev_mmio_metadata));
+	if (ret)
+		kfree(xa_erase(&pkvm->ptdev_metadata_by_bdf, kmeta.bdf));
 out:
 	mutex_unlock(&pkvm->finalized_lock);
 	return ret;
@@ -514,6 +523,7 @@ static int remove_device_from_pkvm(struct device *dev, void *data)
 {
 	struct kvm *kvm = data;
 	struct kvm_pkvm_vm *pkvm = &kvm->arch.pkvm;
+	struct kvm_ptdev_mmio_metadata *cached;
 	struct pci_dev *pdev;
 	u16 devid;
 	int ret;
@@ -529,15 +539,14 @@ static int remove_device_from_pkvm(struct device *dev, void *data)
 	/* Keep the hyp teardown and host mapping records atomic to page faults. */
 	write_lock(&kvm->mmu_lock);
 	ret = pkvm_hypercall(remove_ptdev, pkvm->handle, devid);
-	if (pkvm->ptdev_mmio_metadata_valid &&
-	    pkvm->ptdev_mmio_metadata.segment == pci_domain_nr(pdev->bus) &&
-	    pkvm->ptdev_mmio_metadata.bdf == devid) {
+	cached = xa_load(&pkvm->ptdev_metadata_by_bdf, devid);
+	if (cached && cached->segment == pci_domain_nr(pdev->bus)) {
 		u16 idx;
 
 		/* A failed detach may already have revoked some BAR mappings. */
-		for (idx = 0; idx < pkvm->ptdev_mmio_metadata.nr_ranges; idx++) {
+		for (idx = 0; idx < cached->nr_ranges; idx++) {
 			const struct kvm_protected_vm_ptdev_mmio_range *range =
-				&pkvm->ptdev_mmio_metadata.ranges[idx];
+				&cached->ranges[idx];
 			gfn_t start = range->guest_gpa >> PAGE_SHIFT;
 			gfn_t end = start + (range->size >> PAGE_SHIFT);
 			struct pkvm_mapping *mapping;
@@ -549,11 +558,8 @@ static int remove_device_from_pkvm(struct device *dev, void *data)
 				kfree(mapping);
 			}
 		}
-		if (!ret) {
-			memset(&pkvm->ptdev_mmio_metadata, 0,
-			       sizeof(pkvm->ptdev_mmio_metadata));
-			pkvm->ptdev_mmio_metadata_valid = false;
-		}
+		if (!ret)
+			kfree(xa_erase(&pkvm->ptdev_metadata_by_bdf, devid));
 	}
 	write_unlock(&kvm->mmu_lock);
 	mutex_unlock(&pkvm->finalized_lock);

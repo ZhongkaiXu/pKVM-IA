@@ -287,47 +287,75 @@ bool pkvm_vm_hpa_hits_attached_boot_ptdev_bar(struct kvm *kvm, u64 hpa, u64 size
 	return hit;
 }
 
-static void pkvm_clear_vm_mmio_allowlist(struct pkvm_vm *vm)
+/*
+ * Reserve each device's ranges before handing off its BARs and DMA.
+ * Keep the reservation until detach finishes, including failed detach retries.
+ * Caller holds ptdev->lock. vm->lock protects membership and reservations.
+ */
+static int pkvm_reserve_ptdev_metadata(struct pkvm_vm *vm, struct pkvm_ptdev *ptdev)
 {
+	const struct kvm_ptdev_mmio_metadata *metadata = &ptdev->mmio_metadata;
+	struct pkvm_ptdev *other;
+	unsigned int total = metadata->nr_ranges;
+	u16 i, j;
+	int ret = 0;
+
 	pkvm_spin_lock(&vm->lock);
-	vm->mmio_allow_nr_ranges = 0;
-	vm->mmio_allow_generation = 0;
-	vm->mmio_allow_flags = 0;
-	memset(vm->mmio_allow_ranges, 0, sizeof(vm->mmio_allow_ranges));
+	list_for_each_entry(other, &vm->ptdev_head, vm_node) {
+		const struct kvm_ptdev_mmio_metadata *used = &other->mmio_metadata;
+
+		if (!other->mmio_metadata_valid)
+			continue;
+		total += used->nr_ranges;
+		if (total > ARRAY_SIZE(vm->mmio_allow_ranges)) {
+			ret = -E2BIG;
+			goto out;
+		}
+		for (i = 0; i < metadata->nr_ranges; i++) {
+			const struct kvm_protected_vm_ptdev_mmio_range *range =
+				&metadata->ranges[i];
+
+			for (j = 0; j < used->nr_ranges; j++) {
+				const struct kvm_protected_vm_ptdev_mmio_range *prev =
+					&used->ranges[j];
+
+				if (range->guest_gpa < prev->guest_gpa + prev->size &&
+				    prev->guest_gpa < range->guest_gpa + range->size) {
+					ret = -EINVAL;
+					goto out;
+				}
+			}
+		}
+	}
+	ptdev->mmio_metadata_valid = true;
+out:
 	pkvm_spin_unlock(&vm->lock);
+	return ret;
 }
 
-static void pkvm_update_vm_mmio_allowlist(
-	struct pkvm_vm *vm,
-	const struct kvm_ptdev_mmio_metadata *metadata)
+/* Caller holds vm->lock. The capacity was reserved before BAR handoff. */
+static void pkvm_update_vm_mmio_allowlist(struct pkvm_vm *vm)
 {
-	u16 nr_ranges = 0;
-	u16 i;
+	struct pkvm_ptdev *ptdev;
+	u16 nr = 0;
 
-	pkvm_spin_lock(&vm->lock);
-	memset(vm->mmio_allow_ranges, 0, sizeof(vm->mmio_allow_ranges));
+	list_for_each_entry(ptdev, &vm->ptdev_head, vm_node) {
+		const struct kvm_ptdev_mmio_metadata *meta = &ptdev->mmio_metadata;
+		u16 i;
 
-	for (i = 0; i < metadata->nr_ranges; i++) {
-		const struct kvm_protected_vm_ptdev_mmio_range *range =
-			&metadata->ranges[i];
-		struct pkvm_guest_mmio_allow_range *allow;
-
-		if (range->kind != KVM_PROTECTED_VM_PTDEV_MMIO_KIND_DIRECT_BAR)
+		if (!ptdev->guest_contract_published)
 			continue;
+		for (i = 0; i < meta->nr_ranges; i++) {
+			struct pkvm_guest_mmio_allow_range *allow = &vm->mmio_allow_ranges[nr++];
 
-		if (nr_ranges >= ARRAY_SIZE(vm->mmio_allow_ranges))
-			break;
-
-		allow = &vm->mmio_allow_ranges[nr_ranges++];
-		allow->guest_gpa = range->guest_gpa;
-		allow->size = range->size;
-		allow->flags = PKVM_GUEST_MMIO_ALLOW_FLAG_DIRECT_BAR;
+			allow->guest_gpa = meta->ranges[i].guest_gpa;
+			allow->size = meta->ranges[i].size;
+			allow->flags = PKVM_GUEST_MMIO_ALLOW_FLAG_DIRECT_BAR;
+		}
 	}
-
-	vm->mmio_allow_nr_ranges = nr_ranges;
-	vm->mmio_allow_generation = metadata->generation;
-	vm->mmio_allow_flags = 0;
-	pkvm_spin_unlock(&vm->lock);
+	vm->mmio_allow_nr_ranges = nr;
+	if (!++vm->mmio_allow_generation)
+		vm->mmio_allow_generation = 1;
 }
 
 struct pkvm_ptdev *pkvm_get_ptdev(u16 bdf)
@@ -732,12 +760,17 @@ void pkvm_vm_destroy_ptdevs(struct pkvm_vm *vm)
 	pkvm_spin_unlock(&vm->lock);
 }
 
-static int pkvm_validate_ptdev_mmio_metadata_locked(
-	struct pkvm_ptdev *ptdev,
-	const struct kvm_ptdev_mmio_metadata *metadata)
+static int pkvm_validate_ptdev_mmio_metadata_locked(struct pkvm_ptdev *ptdev)
 {
-	u16 i;
+	const struct kvm_ptdev_mmio_metadata *metadata = &ptdev->mmio_metadata;
+	u16 i, j;
 	int ret;
+
+	if (!metadata->nr_ranges || metadata->nr_ranges > ARRAY_SIZE(metadata->ranges) ||
+	    metadata->nr_ranges > PKVM_GUEST_MMIO_ALLOW_MAX_RANGES ||
+	    metadata->bdf != ptdev->bdf || metadata->segment || metadata->flags ||
+	    metadata->generation != 1)
+		return -EINVAL;
 
 	ret = pkvm_prepare_ptdev_bar_resources_locked(ptdev);
 	if (ret)
@@ -747,11 +780,28 @@ static int pkvm_validate_ptdev_mmio_metadata_locked(
 		const struct kvm_protected_vm_ptdev_mmio_range *range =
 			&metadata->ranges[i];
 
-		if (range->kind != KVM_PROTECTED_VM_PTDEV_MMIO_KIND_DIRECT_BAR)
+		if (!range->size || !PAGE_ALIGNED(range->guest_gpa) ||
+		    !PAGE_ALIGNED(range->size) || !PAGE_ALIGNED(range->bar_offset) ||
+		    range->guest_gpa > U64_MAX - range->size ||
+		    range->bar_offset > U64_MAX - range->size ||
+		    range->__reserved16 || range->__reserved32 ||
+		    range->kind != KVM_PROTECTED_VM_PTDEV_MMIO_KIND_DIRECT_BAR)
 			return -EINVAL;
 		if (!pkvm_ptdev_bar_contains_range_locked(ptdev,
 				range->bar_index, range->bar_offset, range->size))
 			return -EPERM;
+		for (j = 0; j < i; j++) {
+			const struct kvm_protected_vm_ptdev_mmio_range *prev =
+				&metadata->ranges[j];
+
+			if (range->guest_gpa < prev->guest_gpa + prev->size &&
+			    prev->guest_gpa < range->guest_gpa + range->size)
+				return -EINVAL;
+			if (range->bar_index == prev->bar_index &&
+			    range->bar_offset < prev->bar_offset + prev->size &&
+			    prev->bar_offset < range->bar_offset + range->size)
+				return -EINVAL;
+		}
 	}
 
 	return 0;
@@ -780,7 +830,6 @@ static int pkvm_publish_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 	if (ret)
 		return ret;
 
-	pkvm_update_vm_mmio_allowlist(vm, &ptdev->mmio_metadata);
 	for (idx = 0; idx < ptdev->touched_mmio_range_count; idx++) {
 		struct pkvm_ptdev_mmio_range_state *range =
 			&ptdev->touched_mmio_ranges[idx];
@@ -789,8 +838,11 @@ static int pkvm_publish_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 		ptdev->bars[range->bar_index].progress =
 			PKVM_PTDEV_BAR_CONTRACT_PUBLISHED;
 	}
+	pkvm_spin_lock(&vm->lock);
 	ptdev->guest_contract_published = true;
 	ptdev->assignment_state = PKVM_PTDEV_GUEST_ASSIGNED;
+	pkvm_update_vm_mmio_allowlist(vm);
+	pkvm_spin_unlock(&vm->lock);
 	return 0;
 }
 
@@ -800,8 +852,10 @@ static void pkvm_withdraw_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 	if (!ptdev->guest_contract_published)
 		return;
 
-	pkvm_clear_vm_mmio_allowlist(vm);
+	pkvm_spin_lock(&vm->lock);
 	ptdev->guest_contract_published = false;
+	pkvm_update_vm_mmio_allowlist(vm);
+	pkvm_spin_unlock(&vm->lock);
 }
 
 int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
@@ -811,10 +865,10 @@ int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
 	int vm_handle;
 	int ret = 0;
 
-	if (!metadata || !metadata->nr_ranges)
+	if (!metadata)
 		return -EINVAL;
 
-	ptdev = pkvm_get_ptdev(metadata->bdf);
+	ptdev = pkvm_get_ptdev(READ_ONCE(metadata->bdf));
 	if (!ptdev)
 		return -ENODEV;
 
@@ -833,29 +887,24 @@ int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
 	}
 
 	if (!ptdev->mmio_metadata_valid) {
-		ret = pkvm_validate_ptdev_mmio_metadata_locked(ptdev, metadata);
-		if (ret)
-			goto out;
+		/* Validate the device's own copy before reserving or publishing it. */
 		ptdev->mmio_metadata = *metadata;
-		ptdev->mmio_metadata_valid = true;
-		ret = pkvm_publish_ptdev_mmio_contract_locked(vm, ptdev);
-		if (ret == -EAGAIN) {
-			ret = 0;
-		} else if (ret) {
-			ptdev->mmio_metadata_valid = false;
-			memset(&ptdev->mmio_metadata, 0,
-			       sizeof(ptdev->mmio_metadata));
-		}
+		ret = pkvm_validate_ptdev_mmio_metadata_locked(ptdev);
+		if (!ret)
+			ret = pkvm_reserve_ptdev_metadata(vm, ptdev);
+	} else if (!pkvm_ptdev_mmio_metadata_equal(&ptdev->mmio_metadata, metadata)) {
+		ret = -EBUSY;
 		goto out;
 	}
 
-	ret = pkvm_ptdev_mmio_metadata_equal(&ptdev->mmio_metadata, metadata) ?
-	      pkvm_publish_ptdev_mmio_contract_locked(vm, ptdev) : -EBUSY;
-	if (ret == -EAGAIN) {
-		ret = 0;
-	} else if (ret && ret != -EBUSY) {
+	if (!ret)
+		ret = pkvm_publish_ptdev_mmio_contract_locked(vm, ptdev);
+	/* Host caches a submission only after the contract is published. */
+	if (ret && !ptdev->touched_mmio_range_count) {
+		pkvm_spin_lock(&vm->lock);
 		ptdev->mmio_metadata_valid = false;
 		memset(&ptdev->mmio_metadata, 0, sizeof(ptdev->mmio_metadata));
+		pkvm_spin_unlock(&vm->lock);
 	}
 out:
 	pkvm_spin_unlock(&ptdev->lock);

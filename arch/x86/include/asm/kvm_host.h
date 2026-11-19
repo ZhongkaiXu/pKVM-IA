@@ -14,6 +14,7 @@
 #include <linux/tracepoint.h>
 #include <linux/cpumask.h>
 #include <linux/irq_work.h>
+#include <linux/xarray.h>
 #include <linux/irq.h>
 #include <linux/workqueue.h>
 
@@ -816,6 +817,14 @@ struct kvm_pkvm_vm {
 	bool finalized;
 	struct mutex finalized_lock;
 #ifdef CONFIG_PKVM_INTEL
+	/* Host cache under finalized_lock: physical BDF -> metadata pointer. */
+	struct xarray ptdev_metadata_by_bdf;
+
+	/*
+	 * Host-to-hyp transfer slot for the device being submitted.
+	 * valid is set only during sync_ptdev_mmio_metadata(). After success,
+	 * the host retains the metadata in ptdev_metadata_by_bdf until detach.
+	 */
 	bool ptdev_mmio_metadata_valid;
 	struct kvm_ptdev_mmio_metadata ptdev_mmio_metadata;
 #endif

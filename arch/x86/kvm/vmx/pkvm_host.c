@@ -669,6 +669,9 @@ static int pkvm_vm_init(struct kvm *kvm)
 		goto free_pgtable_page;
 
 	kvm->arch.pkvm.handle = ret;
+#ifdef CONFIG_PKVM_INTEL
+	xa_init(&kvm->arch.pkvm.ptdev_metadata_by_bdf);
+#endif
 
 	if (pkvm_is_protected_vm(kvm))
 		kvm->arch.has_protected_state = true;
@@ -689,6 +692,16 @@ static void pkvm_vm_destroy(struct kvm *kvm)
 	struct pkvm_mapping *mapping;
 	union pkvm_hc_data out;
 	int ret;
+
+#ifdef CONFIG_PKVM_INTEL
+	struct xarray *records = &kvm->arch.pkvm.ptdev_metadata_by_bdf;
+	struct kvm_ptdev_mmio_metadata *metadata;
+	unsigned long bdf;
+
+	xa_for_each(records, bdf, metadata)
+		kfree(metadata);
+	xa_destroy(records);
+#endif
 
 	ret = pkvm_hypercall_out(vm_destroy, &out, vm_handle);
 	if (ret) {
