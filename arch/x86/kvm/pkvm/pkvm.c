@@ -1855,12 +1855,12 @@ static int pkvm_vm_mmu_map(unsigned long gpa, unsigned long hpa,
 			return -EPERM;
 		}
 
-		if (pkvm_vm_hpa_hits_attached_boot_ptdev_bar(kvm, hpa, size)) {
+		if (pkvm_vm_mmio_mapping_allowed(kvm, gpa, hpa, size)) {
 			pkvm_err("pkvm: vm_mmu_map: attached BAR gpa=0x%lx hpa=0x%lx size=0x%lx\n",
 				 gpa, hpa, size);
 			ret = pkvm_host_map_guest_mmio(vcpu, gpa, hpa, size);
 		} else if (pkvm_host_hpa_hits_boot_ptdev_bar(hpa, size)) {
-			pkvm_err("pkvm: vm_mmu_map: reject boot ptdev BAR HPA not attached to VM gpa=0x%lx hpa=0x%lx size=0x%lx\n",
+			pkvm_err("pkvm: vm_mmu_map: reject unmatched boot ptdev BAR mapping gpa=0x%lx hpa=0x%lx size=0x%lx\n",
 				 gpa, hpa, size);
 			ret = -EPERM;
 		} else {

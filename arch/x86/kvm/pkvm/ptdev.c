@@ -173,8 +173,8 @@ static int pkvm_ptdev_range_hpa_locked(struct pkvm_ptdev *ptdev,
 	return 0;
 }
 
-static bool pkvm_ptdev_hpa_hits_direct_mmio_locked(struct pkvm_ptdev *ptdev,
-						   u64 hpa, u64 size)
+static bool pkvm_ptdev_mmio_mapping_allowed(struct pkvm_ptdev *ptdev,
+					    u64 gpa, u64 hpa, u64 size)
 {
 	u64 end;
 	u16 idx;
@@ -190,11 +190,14 @@ static bool pkvm_ptdev_hpa_hits_direct_mmio_locked(struct pkvm_ptdev *ptdev,
 
 		if (range->kind != KVM_PROTECTED_VM_PTDEV_MMIO_KIND_DIRECT_BAR)
 			continue;
+		if (gpa < range->guest_gpa || gpa >= range->guest_gpa + range->size)
+			continue;
 		if (pkvm_ptdev_range_hpa_locked(ptdev, range, &range_hpa))
 			continue;
 		if (range_hpa > U64_MAX - range->size)
 			continue;
-		if (hpa >= range_hpa && end <= range_hpa + range->size)
+		if (hpa >= range_hpa && end <= range_hpa + range->size &&
+		    hpa - range_hpa == gpa - range->guest_gpa)
 			return true;
 	}
 
@@ -261,7 +264,7 @@ bool pkvm_is_boot_ptdev(u16 bdf)
 	return pkvm_boot_ptdev_manifest_lookup(bdf) != NULL;
 }
 
-bool pkvm_vm_hpa_hits_attached_boot_ptdev_bar(struct kvm *kvm, u64 hpa, u64 size)
+bool pkvm_vm_mmio_mapping_allowed(struct kvm *kvm, u64 gpa, u64 hpa, u64 size)
 {
 	struct pkvm_vm *vm;
 	struct pkvm_ptdev *ptdev;
@@ -277,7 +280,7 @@ bool pkvm_vm_hpa_hits_attached_boot_ptdev_bar(struct kvm *kvm, u64 hpa, u64 size
 		if (!pkvm_ptdev_allows_guest_bar_mapping_locked(ptdev))
 			continue;
 
-		if (pkvm_ptdev_hpa_hits_direct_mmio_locked(ptdev, hpa, size)) {
+		if (pkvm_ptdev_mmio_mapping_allowed(ptdev, gpa, hpa, size)) {
 			hit = true;
 			break;
 		}
